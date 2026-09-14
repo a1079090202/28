@@ -16,6 +16,8 @@ import db
 import repository as repo
 import seed
 import services
+from options import keyed_options
+from db import LAYOUT_VALUES as LAYOUTS
 from state_machine import (
     STATUS_DEAL,
     TERMINAL_STATUSES,
@@ -27,14 +29,31 @@ st.set_page_config(page_title="门店带看管理", page_icon="🏠", layout="wi
 
 
 @st.cache_resource
+def init_schema():
+    """进程级一次性建表（cache_resource 跨会话只执行一次且自带锁，避免并发首启竞态）。"""
+    setup = db.connect(db.DEFAULT_DB_PATH)
+    try:
+        db.init_db(setup)
+    finally:
+        setup.close()
+    return True
+
+
 def get_conn():
-    conn = db.connect(db.DEFAULT_DB_PATH)
-    db.init_db(conn)
-    return conn
+    """每个浏览器会话一个独立连接，绝不跨用户共享。
+
+    多人同时用时，共享连接会让 A 的多步事务被 B 的 commit 连带提交、被 B 的
+    rollback 连带回滚（事务边界串台）。session_state 按会话隔离连接，
+    写事务再由 services 层用 BEGIN IMMEDIATE 串行化，两者配合才安全。
+    """
+    if "db_conn" not in st.session_state:
+        init_schema()  # 确保表已建好（幂等）
+        st.session_state.db_conn = db.connect(db.DEFAULT_DB_PATH)
+    return st.session_state.db_conn
 
 
 conn = get_conn()
-seed.ensure_seed(conn)  # 首次启动写入样例数据，之后自动跳过
+seed.ensure_seed(conn)  # 首次启动写入样例数据；并发首启时后来者安静跳过
 
 st.sidebar.title("🏠 门店管理")
 operator = st.sidebar.text_input("当前操作人", value="店长").strip() or "店长"
@@ -71,7 +90,7 @@ def csv_download(label, rows, headers, filename):
     st.download_button(label, buf.getvalue().encode("utf-8-sig"), filename, "text/csv")
 
 
-LAYOUTS = ["一室一厅", "两室一厅", "两室两厅", "三室一厅", "三室两厅", "四室两厅", "五室及以上", "其他"]
+# 户型选项复用 db.LAYOUT_VALUES：数据库 CHECK 枚举与页面下拉框是同一份清单
 
 
 # ---------- 门店大盘 ----------
@@ -164,10 +183,13 @@ def page_properties():
             elif price <= 0:
                 st.error("挂牌价必须大于 0")
             else:
-                services.add_property(
-                    conn, community.strip(), layout, price, list_date.isoformat(), operator
-                )
-                st.success("房源已录入")
+                try:
+                    services.add_property(
+                        conn, community.strip(), layout, price, list_date.isoformat(), operator
+                    )
+                    st.success("房源已录入")
+                except (ValueError, services.BusyError) as e:
+                    st.error(str(e))
 
     st.subheader("全部房源")
     props = repo.list_properties(conn)
@@ -200,22 +222,26 @@ def page_customers():
     st.header("👥 客户管理")
 
     agents = repo.list_agents(conn)
-    agent_ids = {a["name"]: a["id"] for a in agents}
 
     with st.form("add_customer", clear_on_submit=True):
         st.subheader("新增客户")
         c1, c2, c3 = st.columns(3)
         name = c1.text_input("客户姓名")
         phone = c2.text_input("联系电话")
-        agent_name = c3.selectbox("负责经纪人", list(agent_ids.keys()))
+        agent = agents[c3.selectbox(
+            "负责经纪人", range(len(agents)), format_func=lambda i: agents[i]["name"]
+        )]
         if st.form_submit_button("新增客户", type="primary"):
             if not name.strip():
                 st.error("客户姓名不能为空")
             else:
-                services.register_customer(
-                    conn, name.strip(), phone.strip(), agent_ids[agent_name], operator
-                )
-                st.success("客户已新增，初始状态：新客")
+                try:
+                    services.register_customer(
+                        conn, name.strip(), phone.strip(), agent["id"], operator
+                    )
+                    st.success("客户已新增，初始状态：新客")
+                except (ValueError, services.BusyError) as e:
+                    st.error(str(e))
 
     st.subheader("推进客户状态")
     customers = repo.list_customers(conn)
@@ -223,7 +249,7 @@ def page_customers():
     if not active:
         st.info("当前没有进行中的客户")
     else:
-        options = {f"#{c['id']} {c['name']}（当前：{c['status']}）": c for c in active}
+        options = keyed_options(active, lambda c: f"{c['name']}（当前：{c['status']}）")
         customer = options[st.selectbox("选择客户", list(options.keys()))]
         targets = next_statuses(customer["status"])
         st.write(f"当前状态：**{customer['status']}**，只能推进到：{' / '.join(targets)}")
@@ -237,29 +263,39 @@ def page_customers():
                 st.warning("没有在售房源，无法登记成交")
                 can_submit = False
             else:
-                p_opts = {
-                    f"{p['community']} {p['layout']}（挂牌 {p['list_price']} 万）": p
-                    for p in on_sale
-                }
+                p_opts = keyed_options(
+                    on_sale,
+                    lambda p: f"{p['community']} {p['layout']}（挂牌 {p['list_price']} 万，{p['list_date']}）",
+                )
                 prop = p_opts[st.selectbox("成交房源", list(p_opts.keys()))]
                 d1, d2 = st.columns(2)
                 deal_price = d1.number_input("成交价（万）", min_value=0.0, step=1.0, format="%.1f")
                 deal_date = d2.date_input("成交日期", value=date.today())
-                deal = (prop, deal_price, deal_date)
+                deal_agent_idx = next(
+                    (i for i, ag in enumerate(agents) if ag["id"] == customer["agent_id"]), 0
+                )
+                deal_agent = agents[st.selectbox(
+                    "成交经纪人（业绩归属，默认负责经纪人）",
+                    range(len(agents)), index=deal_agent_idx,
+                    format_func=lambda i: agents[i]["name"],
+                )]
+                deal = (prop, deal_price, deal_date, deal_agent)
 
         if can_submit and st.button("确认推进", type="primary"):
             try:
                 if target == STATUS_DEAL:
-                    prop, deal_price, deal_date = deal
+                    prop, deal_price, deal_date, deal_agent = deal
                     services.close_deal(
-                        conn, customer["id"], prop["id"], customer["agent_id"],
+                        conn, customer["id"], prop["id"], deal_agent["id"],
                         deal_price, deal_date.isoformat(), operator,
                     )
-                    st.success(f"已成交：{customer['name']} × {prop['community']}")
+                    st.success(
+                        f"已成交：{customer['name']} × {prop['community']}（归属：{deal_agent['name']}）"
+                    )
                 else:
                     services.advance_customer(conn, customer["id"], target, operator)
                     st.success(f"已推进：{customer['status']} → {target}")
-            except (InvalidTransitionError, ValueError) as e:
+            except (InvalidTransitionError, ValueError, services.BusyError) as e:
                 st.error(str(e))
 
         st.caption("该客户跟进记录")
@@ -312,9 +348,12 @@ def page_viewings():
     if not customers or not props:
         st.warning("需要先有进行中的客户和在售房源，才能登记带看")
     else:
-        c_opts = {f"#{c['id']} {c['name']}（{c['status']}）": c for c in customers}
+        c_opts = keyed_options(customers, lambda c: f"{c['name']}（{c['status']}）")
         customer = c_opts[st.selectbox("客户", list(c_opts.keys()))]
-        p_opts = {f"{p['community']} {p['layout']}（{p['list_price']} 万）": p for p in props}
+        p_opts = keyed_options(
+            props,
+            lambda p: f"{p['community']} {p['layout']}（{p['list_price']} 万，挂牌 {p['list_date']}）",
+        )
         prop = p_opts[st.selectbox("房源", list(p_opts.keys()))]
         default_idx = next(
             (i for i, a in enumerate(agents) if a["id"] == customer["agent_id"]), 0
@@ -330,11 +369,14 @@ def page_viewings():
         )
         st.caption("新客首次带看后，状态会自动推进为「带看」。")
         if st.button("登记带看", type="primary"):
-            services.record_viewing(
-                conn, customer["id"], prop["id"], agent["id"],
-                datetime.combine(v_date, v_time), operator,
-            )
-            st.success("带看已登记，记得 24 小时内补客户反馈")
+            try:
+                services.record_viewing(
+                    conn, customer["id"], prop["id"], agent["id"],
+                    datetime.combine(v_date, v_time), operator,
+                )
+                st.success("带看已登记，记得 24 小时内补客户反馈")
+            except (InvalidTransitionError, ValueError, services.BusyError) as e:
+                st.error(str(e))
 
     st.subheader("补客户反馈")
     all_viewings = repo.list_viewings(conn)
@@ -342,18 +384,21 @@ def page_viewings():
     if not pending:
         st.info("没有待补反馈的带看")
     else:
-        v_opts = {
-            f"#{v['id']} {v['viewing_time']}　{v['customer_name']} @ {v['community']}": v
-            for v in pending
-        }
+        v_opts = keyed_options(
+            pending,
+            lambda v: f"{v['viewing_time']}　{v['customer_name']} @ {v['community']}",
+        )
         viewing = v_opts[st.selectbox("选择带看记录", list(v_opts.keys()))]
         feedback = st.text_area("客户反馈", placeholder="客户看完怎么说？意向、顾虑、还价……")
         if st.button("提交反馈", type="primary"):
             if not feedback.strip():
                 st.error("反馈内容不能为空")
             else:
-                services.submit_feedback(conn, viewing["id"], feedback.strip())
-                st.success("反馈已保存")
+                try:
+                    services.submit_feedback(conn, viewing["id"], feedback.strip())
+                    st.success("反馈已保存")
+                except (ValueError, services.BusyError) as e:
+                    st.error(str(e))
 
     st.subheader("全部带看记录")
     now = datetime.now()

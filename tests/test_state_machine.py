@@ -89,7 +89,10 @@ class TestServiceEnforcement(unittest.TestCase):
         self.assertEqual(repo.get_customer(self.conn, self.cid)["status"], STATUS_NEW)
 
     def test_deal_must_go_through_close_deal(self):
-        services.advance_customer(self.conn, self.cid, STATUS_VIEWING, "店长", now=datetime(2026, 9, 2, 10))
+        services.record_viewing(
+            self.conn, self.cid, self.pid, self.aid,
+            datetime(2026, 9, 2, 10), "店长", now=datetime(2026, 9, 2, 10),
+        )  # 登记带看后自动进入「带看」
         services.advance_customer(self.conn, self.cid, STATUS_NEGOTIATING, "店长", now=datetime(2026, 9, 3, 10))
         with self.assertRaises(ValueError):
             services.advance_customer(self.conn, self.cid, STATUS_DEAL, "店长", now=datetime(2026, 9, 4, 10))
@@ -103,7 +106,10 @@ class TestServiceEnforcement(unittest.TestCase):
             )
 
     def test_full_legal_path_then_locked(self):
-        services.advance_customer(self.conn, self.cid, STATUS_VIEWING, "店长", now=datetime(2026, 9, 2, 10))
+        services.record_viewing(
+            self.conn, self.cid, self.pid, self.aid,
+            datetime(2026, 9, 2, 10), "店长", now=datetime(2026, 9, 2, 10),
+        )
         services.advance_customer(self.conn, self.cid, STATUS_NEGOTIATING, "店长", now=datetime(2026, 9, 3, 10))
         services.close_deal(
             self.conn, self.cid, self.pid, self.aid, 180, "2026-09-04", "店长",

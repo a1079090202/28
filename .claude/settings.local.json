@@ -3,7 +3,9 @@
     "allow": [
       "Bash(python *)",
       "Bash(python3 *)",
-      "Bash(pip3 install *)"
+      "Bash(pip3 install *)",
+      "Bash(python3 -m py_compile app.py)",
+      "Bash(timeout 60 python3 -m unittest discover -s tests)"
     ]
   }
 }

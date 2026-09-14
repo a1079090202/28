@@ -4,6 +4,7 @@
 保证多步写入（如成交 = 改状态 + 写历史 + 写成交单）在一个事务里。
 时间一律为本地时间字符串：日期 'YYYY-MM-DD'，时间 'YYYY-MM-DD HH:MM:SS'。
 """
+from datetime import datetime
 
 
 # ---------- 经纪人 ----------
@@ -23,6 +24,12 @@ def list_agents(conn, only_active=True):
     return conn.execute(sql + " ORDER BY id").fetchall()
 
 
+def get_agent(conn, agent_id):
+    return conn.execute(
+        "SELECT * FROM agents WHERE id = ?", (agent_id,)
+    ).fetchone()
+
+
 # ---------- 房源 ----------
 
 def add_property(conn, community, layout, list_price, list_date, operator, now):
@@ -32,6 +39,12 @@ def add_property(conn, community, layout, list_price, list_date, operator, now):
         (community, layout, list_price, list_date, operator, now),
     )
     return cur.lastrowid
+
+
+def get_property(conn, property_id):
+    return conn.execute(
+        "SELECT * FROM properties WHERE id = ?", (property_id,)
+    ).fetchone()
 
 
 def list_properties(conn):
@@ -116,11 +129,33 @@ def list_viewings(conn):
     ).fetchall()
 
 
+def get_viewing(conn, viewing_id):
+    return conn.execute(
+        "SELECT * FROM viewings WHERE id = ?", (viewing_id,)
+    ).fetchone()
+
+
+def has_viewing(conn, customer_id):
+    """该客户是否登记过任意一条带看。"""
+    return conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM viewings WHERE customer_id = ?)", (customer_id,)
+    ).fetchone()[0] == 1
+
+
+def first_viewing_date(conn, customer_id):
+    """该客户首次带看的日期（date 对象），没有带看则 None。"""
+    row = conn.execute(
+        "SELECT MIN(viewing_time) FROM viewings WHERE customer_id = ?", (customer_id,)
+    ).fetchone()[0]
+    return datetime.strptime(row, "%Y-%m-%d %H:%M:%S").date() if row else None
+
+
 def set_feedback(conn, viewing_id, feedback, feedback_at):
-    conn.execute(
+    cur = conn.execute(
         "UPDATE viewings SET feedback = ?, feedback_at = ? WHERE id = ?",
         (feedback, feedback_at, viewing_id),
     )
+    return cur.rowcount
 
 
 # ---------- 成交 ----------
@@ -170,11 +205,24 @@ def count_viewings(conn, start, end):
 
 
 def count_status_entries(conn, to_status, start, end):
-    """本月内状态推进到 to_status 的次数（按状态历史算，跨月不串）。"""
+    """本月内状态推进到 to_status 的次数（按状态历史的操作时间算，跨月不串）。
+
+    「成交」不走这里：成交有独立业务日期 deals.deal_date，用 count_deals，
+    保证漏斗/月报/成交列表三处成交数用同一个口径。
+    """
     return _count(
         conn,
         "SELECT COUNT(*) FROM status_history WHERE to_status = ? AND created_at >= ? AND created_at < ?",
         (to_status, start, end),
+    )
+
+
+def count_deals(conn, start, end):
+    """[start, end) 内按成交日期 deals.deal_date 统计的成交单数。"""
+    return _count(
+        conn,
+        "SELECT COUNT(*) FROM deals WHERE deal_date >= ? AND deal_date < ?",
+        (start, end),
     )
 
 
@@ -209,7 +257,11 @@ def overdue_feedback_viewings(conn, deadline):
 
 
 def agent_monthly_report(conn, start, end):
-    """每个经纪人在 [start, end) 内的带看组数和成交单数。"""
+    """每个经纪人在 [start, end) 内的带看组数和成交单数。
+
+    历史月报包含已停用经纪人（否则离职人员的历史业绩会从合计里消失，
+    与门店漏斗对不上）；停用经纪人排在末尾。
+    """
     return conn.execute(
         """SELECT a.id, a.name,
                   (SELECT COUNT(*) FROM viewings v
@@ -217,7 +269,6 @@ def agent_monthly_report(conn, start, end):
                   (SELECT COUNT(*) FROM deals d
                     WHERE d.agent_id = a.id AND d.deal_date >= ? AND d.deal_date < ?) AS deal_count
            FROM agents a
-           WHERE a.active = 1
-           ORDER BY viewing_count DESC, deal_count DESC, a.id""",
+           ORDER BY a.active DESC, viewing_count DESC, deal_count DESC, a.id""",
         (start, end, start, end),
     ).fetchall()

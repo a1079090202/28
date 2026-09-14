@@ -20,7 +20,7 @@ AGENTS = [
 PROPERTIES = [
     ("阳光花园", "两室一厅", 185, 12),
     ("翠湖天地", "三室两厅", 420, 25),
-    ("金域蓝湾", "两室两厅", 260, 8),
+    ("金域蓝湾", "两室两厅", 260, 20),
     ("保利心语", "三室一厅", 310, 60),      # 滞销：超 45 天无带看
     ("万科城市花园", "四室两厅", 550, 75),   # 滞销：带看在 37 天前
     ("恒大绿洲", "两室一厅", 168, 18),
@@ -39,7 +39,7 @@ CUSTOMERS = [
     ("周女士", "13800000005", 3, 10),
     ("吴先生", "13800000006", 4, 6),
     ("郑女士", "13800000007", 5, 8),
-    ("孙先生", "13800000008", 6, 20),
+    ("孙先生", "13800000008", 6, 35),
     ("钱女士", "13800000009", 7, 3),
     ("冯先生", "13800000010", 1, 40),
     ("何女士", "13800000011", 2, 1),
@@ -63,7 +63,7 @@ VIEWINGS = [
     (6, 1, 5, 130, None),                   # 超时未反馈
     (7, 6, 6, 720, "看完没再联系"),
     (9, 4, 1, 900, "超预算太多"),
-    (11, 7, 3, 140, "总价高，犹豫"),
+    (11, 7, 3, 100, "总价高，犹豫"),
     (11, 2, 3, 55, None),                   # 超时未反馈
     (12, 8, 4, 235, "华润悦府有意向"),
     (12, 1, 4, 100, "二看，准备约房东谈"),
@@ -87,45 +87,61 @@ STATUS_PLAN = [
 
 
 def ensure_seed(conn):
-    """数据库为空时写入样例数据；已有数据则跳过。返回是否执行了写入。"""
+    """数据库为空时写入样例数据；已有数据则跳过。返回是否执行了写入。
+
+    多人同时首次打开应用时，每个浏览器会话有独立连接，可能并发进入本函数：
+    第一个写入的经纪人一旦提交，后来者就会看到 agents 非空而直接返回；
+    若双方在首条写入前同时进入，唯一约束会让一方失败——此时重查一次，
+    确认是别人在灌库就安静跳过，而不是把启动报错抛给用户。
+    """
     if repo.list_agents(conn):
         return False
     base = datetime.now().replace(microsecond=0)
+    try:
+        agent_ids = [services.add_agent(conn, name, phone, now=base) for name, phone in AGENTS]
 
-    agent_ids = [services.add_agent(conn, name, phone, now=base) for name, phone in AGENTS]
-
-    prop_ids = []
-    for community, layout, price, days in PROPERTIES:
-        list_date = (base - timedelta(days=days)).strftime("%Y-%m-%d")
-        prop_ids.append(
-            services.add_property(conn, community, layout, price, list_date, OPERATOR, now=base)
-        )
-
-    cust_ids = []
-    for name, phone, ai, days in CUSTOMERS:
-        cust_ids.append(
-            services.register_customer(
-                conn, name, phone, agent_ids[ai], OPERATOR, now=base - timedelta(days=days)
+        prop_ids = []
+        for community, layout, price, days in PROPERTIES:
+            list_date = (base - timedelta(days=days)).strftime("%Y-%m-%d")
+            prop_ids.append(
+                services.add_property(conn, community, layout, price, list_date, OPERATOR, now=base)
             )
-        )
 
-    # 按时间从旧到新登记带看，状态自动推进的时间线才合理
-    for ci, pi, ai, hours, feedback in sorted(VIEWINGS, key=lambda v: -v[3]):
-        vt = base - timedelta(hours=hours)
-        vid = services.record_viewing(
-            conn, cust_ids[ci], prop_ids[pi], agent_ids[ai], vt, OPERATOR, now=vt
-        )
-        if feedback:
-            services.submit_feedback(conn, vid, feedback, now=vt + timedelta(hours=3))
-
-    for ci, target, hours, deal in sorted(STATUS_PLAN, key=lambda x: -x[2]):
-        when = base - timedelta(hours=hours)
-        if target == "成交":
-            pi, price = deal
-            services.close_deal(
-                conn, cust_ids[ci], prop_ids[pi], agent_ids[CUSTOMERS[ci][2]],
-                price, when.strftime("%Y-%m-%d"), OPERATOR, now=when,
+        cust_ids = []
+        for name, phone, ai, days in CUSTOMERS:
+            cust_ids.append(
+                services.register_customer(
+                    conn, name, phone, agent_ids[ai], OPERATOR, now=base - timedelta(days=days)
+                )
             )
-        else:
-            services.advance_customer(conn, cust_ids[ci], target, OPERATOR, now=when)
-    return True
+
+        # 按时间从旧到新登记带看，状态自动推进的时间线才合理
+        for ci, pi, ai, hours, feedback in sorted(VIEWINGS, key=lambda v: -v[3]):
+            vt = base - timedelta(hours=hours)
+            vid = services.record_viewing(
+                conn, cust_ids[ci], prop_ids[pi], agent_ids[ai], vt, OPERATOR, now=vt
+            )
+            if feedback:
+                services.submit_feedback(conn, vid, feedback, now=vt + timedelta(hours=3))
+
+        for ci, target, hours, deal in sorted(STATUS_PLAN, key=lambda x: -x[2]):
+            when = base - timedelta(hours=hours)
+            if target == "成交":
+                pi, price = deal
+                services.close_deal(
+                    conn, cust_ids[ci], prop_ids[pi], agent_ids[CUSTOMERS[ci][2]],
+                    price, when.strftime("%Y-%m-%d"), OPERATOR, now=when,
+                )
+            else:
+                services.advance_customer(conn, cust_ids[ci], target, OPERATOR, now=when)
+        return True
+    except (services.ValidationError, services.BusyError):
+        # 另一个启动者正在/已经灌库（唯一约束冲突或写锁竞争）：
+        # 丢弃本连接的半截事务，重查确认后安静跳过。
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        if repo.list_agents(conn):
+            return False
+        raise
