@@ -109,6 +109,16 @@ def page_dashboard():
     ).set_index("阶段")
     st.bar_chart(chart)
 
+    st.subheader("本月带看 · 按挂牌价快照分桶")
+    buckets = services.funnel_viewing_price_buckets(conn, year, month)
+    cols = st.columns(3)
+    for col, (label, n) in zip(cols, buckets.items()):
+        col.metric(label, n)
+    st.caption(
+        "按带看登记时冻结的挂牌价快照分桶（与带看记录页同一口径）；"
+        "边界值归下桶：150 万整归「150万以下」，200 万整归「150-200万」。"
+    )
+
     st.subheader("本月成交记录")
     deals = services.deals_of_month(conn, year, month)
     if deals:
@@ -135,13 +145,14 @@ def page_dashboard():
                 "带看时间": v["viewing_time"],
                 "客户": v["customer_name"],
                 "小区": v["community"],
-                "经纪人": v["agent_name"],
+                "主带经纪人": v["agent_name"],
+                "待补反馈": v["pending_agents"],
                 "登记人": v["created_by"],
             }
             for v in overdue
         ]
         st.dataframe(rows, use_container_width=True, hide_index=True)
-        st.caption("请到「带看登记」页补齐客户反馈。")
+        st.caption("请到「带看登记」页补齐客户反馈（协同带看需每位参与人各自提交）。")
     else:
         st.success("没有超时未反馈的带看 👍")
 
@@ -191,8 +202,36 @@ def page_properties():
                 except (ValueError, services.BusyError) as e:
                     st.error(str(e))
 
-    st.subheader("全部房源")
     props = repo.list_properties(conn)
+
+    with st.form("adjust_price", clear_on_submit=True):
+        st.subheader("房源调价")
+        on_sale = [p for p in props if p["status"] == "在售"]
+        if not on_sale:
+            st.info("没有在售房源，无法调价")
+        else:
+            p_opts = keyed_options(
+                on_sale,
+                lambda p: f"{p['community']} {p['layout']}（当前 {p['list_price']:g} 万）",
+            )
+            prop = p_opts[st.selectbox("调价房源", list(p_opts.keys()))]
+            c1, c2 = st.columns(2)
+            new_price = c1.number_input("新挂牌价（万）", min_value=0.0, step=1.0, format="%.1f")
+            eff_date = c2.date_input("生效日期", value=date.today(), key="adj_eff_date")
+            st.caption(
+                "生效日期可填过去某天（追溯调价）：已登记的带看仍按登记时冻结的快照价，"
+                "之后新登记的带看按新生效价取快照；每次调价都会留痕（见下方调价历史）。"
+            )
+            if st.form_submit_button("确认调价", type="primary"):
+                try:
+                    services.adjust_price(
+                        conn, prop["id"], new_price, eff_date.isoformat(), operator
+                    )
+                    st.success(f"已调价：{prop['list_price']:g} 万 → {new_price:g} 万（{eff_date} 起生效）")
+                except (ValueError, services.BusyError) as e:
+                    st.error(str(e))
+
+    st.subheader("全部房源")
     today = date.today()
     rows = [
         {
@@ -201,6 +240,7 @@ def page_properties():
             "挂牌价(万)": p["list_price"],
             "挂牌日期": p["list_date"],
             "挂牌天数": (today - date.fromisoformat(p["list_date"])).days,
+            "带看次数": p["viewing_count"],
             "状态": p["status"],
             "录入人": p["created_by"],
             "录入时间": p["created_at"],
@@ -211,9 +251,32 @@ def page_properties():
     csv_download(
         "导出房源 CSV",
         rows,
-        ["小区", "户型", "挂牌价(万)", "挂牌日期", "挂牌天数", "状态", "录入人", "录入时间"],
+        ["小区", "户型", "挂牌价(万)", "挂牌日期", "挂牌天数", "带看次数", "状态", "录入人", "录入时间"],
         "房源.csv",
     )
+
+    st.subheader("调价历史")
+    if not props:
+        st.info("暂无房源")
+    else:
+        h_opts = keyed_options(props, lambda p: f"{p['community']} {p['layout']}")
+        h_prop = h_opts[st.selectbox("查看房源", list(h_opts.keys()))]
+        history = repo.list_price_adjustments(conn, h_prop["id"])
+        st.dataframe(
+            [
+                {
+                    "登记时间": h["created_at"],
+                    "生效日期": h["effective_date"],
+                    "调价前(万)": h["old_price"] if h["old_price"] is not None else "—（初始挂牌）",
+                    "调价后(万)": h["new_price"],
+                    "操作人": h["operator"],
+                }
+                for h in history
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption("带看的价格快照按「带看日期」从本表推算：生效日期不晚于带看日期的最新一条记录。")
 
 
 # ---------- 客户管理 ----------
@@ -352,51 +415,76 @@ def page_viewings():
         customer = c_opts[st.selectbox("客户", list(c_opts.keys()))]
         p_opts = keyed_options(
             props,
-            lambda p: f"{p['community']} {p['layout']}（{p['list_price']} 万，挂牌 {p['list_date']}）",
+            lambda p: f"{p['community']} {p['layout']}（{p['list_price']:g} 万，挂牌 {p['list_date']}）",
         )
         prop = p_opts[st.selectbox("房源", list(p_opts.keys()))]
         default_idx = next(
             (i for i, a in enumerate(agents) if a["id"] == customer["agent_id"]), 0
         )
         agent = agents[st.selectbox(
-            "带看经纪人", range(len(agents)),
+            "主带经纪人", range(len(agents)),
             index=default_idx, format_func=lambda i: agents[i]["name"],
         )]
+        assist_pool = [a for a in agents if a["id"] != agent["id"]]
+        assist_names = st.multiselect(
+            "协同经纪人（可选，最多 2 人；业绩按主带 70%、协同平分 30% 折算带看积分）",
+            [a["name"] for a in assist_pool],
+            max_selections=2,
+        )
+        assist_ids = [a["id"] for a in assist_pool if a["name"] in assist_names]
         d1, d2 = st.columns(2)
         v_date = d1.date_input("带看日期", value=date.today())
         v_time = d2.time_input(
             "带看时间", value=datetime.now().time().replace(second=0, microsecond=0)
         )
-        st.caption("新客首次带看后，状态会自动推进为「带看」。")
+        st.caption(
+            "登记时自动按带看日期取当时生效的挂牌价快照（之后调价不改写）；"
+            "新客首次带看后，状态会自动推进为「带看」（协同带看也只推一次）。"
+        )
         if st.button("登记带看", type="primary"):
             try:
-                services.record_viewing(
+                vid = services.record_viewing(
                     conn, customer["id"], prop["id"], agent["id"],
                     datetime.combine(v_date, v_time), operator,
+                    assist_agent_ids=assist_ids,
                 )
-                st.success("带看已登记，记得 24 小时内补客户反馈")
+                snapshot = repo.get_viewing(conn, vid)["list_price_snapshot"]
+                st.success(f"带看已登记（挂牌价快照 {snapshot:g} 万），记得 24 小时内补客户反馈")
             except (InvalidTransitionError, ValueError, services.BusyError) as e:
                 st.error(str(e))
 
-    st.subheader("补客户反馈")
     all_viewings = repo.list_viewings(conn)
-    pending = [v for v in all_viewings if not v["feedback"]]
-    if not pending:
+    participants = repo.list_all_participants(conn)
+    by_viewing = {}
+    for p in participants:
+        by_viewing.setdefault(p["viewing_id"], []).append(p)
+
+    st.subheader("补客户反馈")
+    pending_pairs = [
+        (v, p)
+        for v in all_viewings
+        for p in by_viewing.get(v["id"], [])
+        if not p["feedback"]
+    ]
+    if not pending_pairs:
         st.info("没有待补反馈的带看")
     else:
-        v_opts = keyed_options(
-            pending,
-            lambda v: f"{v['viewing_time']}　{v['customer_name']} @ {v['community']}",
-        )
-        viewing = v_opts[st.selectbox("选择带看记录", list(v_opts.keys()))]
+        p_opts = {
+            f"#{v['id']}-{p['agent_id']} {v['viewing_time']}　{v['customer_name']} @ "
+            f"{v['community']}（待 {p['agent_name']}·{p['role']}）": (v, p)
+            for v, p in pending_pairs
+        }
+        viewing, participant = p_opts[st.selectbox("选择待反馈记录", list(p_opts.keys()))]
         feedback = st.text_area("客户反馈", placeholder="客户看完怎么说？意向、顾虑、还价……")
         if st.button("提交反馈", type="primary"):
             if not feedback.strip():
                 st.error("反馈内容不能为空")
             else:
                 try:
-                    services.submit_feedback(conn, viewing["id"], feedback.strip())
-                    st.success("反馈已保存")
+                    services.submit_feedback(
+                        conn, viewing["id"], participant["agent_id"], feedback.strip()
+                    )
+                    st.success(f"已保存（{participant['agent_name']} 的反馈）")
                 except (ValueError, services.BusyError) as e:
                     st.error(str(e))
 
@@ -404,22 +492,31 @@ def page_viewings():
     now = datetime.now()
     rows = []
     for v in all_viewings:
+        parts = by_viewing.get(v["id"], [])
+        lead = next((p for p in parts if p["role"] == "主带"), None)
+        assists = [p for p in parts if p["role"] == "协同"]
+        missing = [p for p in parts if not p["feedback"]]
         vt = datetime.strptime(v["viewing_time"], services.FMT)
-        if v["feedback"]:
+        if parts and not missing:
             fb_status = "已反馈"
         elif (now - vt).total_seconds() > services.FEEDBACK_DEADLINE_HOURS * 3600:
             fb_status = "⚠️ 已超时"
         else:
-            fb_status = "待反馈"
+            fb_status = f"待反馈（缺 {len(missing)} 人）" if parts else "待反馈"
         rows.append(
             {
                 "带看时间": v["viewing_time"],
                 "客户": v["customer_name"],
                 "小区": v["community"],
                 "户型": v["layout"],
-                "经纪人": v["agent_name"],
+                "挂牌价快照(万)": v["list_price_snapshot"],
+                "价格区间": services.price_bucket(v["list_price_snapshot"]),
+                "主带": lead["agent_name"] if lead else v["agent_name"],
+                "协同": "、".join(p["agent_name"] for p in assists) or "—",
                 "反馈状态": fb_status,
-                "客户反馈": v["feedback"] or "",
+                "客户反馈": "；".join(
+                    f"{p['agent_name']}：{p['feedback']}" for p in parts if p["feedback"]
+                ),
                 "登记人": v["created_by"],
             }
         )
@@ -427,7 +524,8 @@ def page_viewings():
     csv_download(
         "导出带看 CSV",
         rows,
-        ["带看时间", "客户", "小区", "户型", "经纪人", "反馈状态", "客户反馈", "登记人"],
+        ["带看时间", "客户", "小区", "户型", "挂牌价快照(万)", "价格区间",
+         "主带", "协同", "反馈状态", "客户反馈", "登记人"],
         "带看记录.csv",
     )
 
@@ -438,14 +536,23 @@ def page_report():
     st.header("📈 经纪人月报")
     year, month = month_selector("report_month")
     rows = [
-        {"经纪人": r["name"], "带看组数": r["viewing_count"], "成交单数": r["deal_count"]}
+        {
+            "经纪人": r["name"],
+            "带看组数(主带)": r["viewing_count"],
+            "带看积分": r["viewing_points"],
+            "成交单数": r["deal_count"],
+        }
         for r in services.monthly_agent_report(conn, year, month)
     ]
     st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.caption(
+        "带看积分：单独带看 1 分；协同带看主带 0.7 分、协同经纪人平分 0.3 分。"
+        "带看组数按主带计，与门店漏斗同口径（一条协同带看只算一次）。"
+    )
     csv_download(
         "导出月报 CSV",
         rows,
-        ["经纪人", "带看组数", "成交单数"],
+        ["经纪人", "带看组数(主带)", "带看积分", "成交单数"],
         f"经纪人月报-{year}-{month:02d}.csv",
     )
 

@@ -10,7 +10,7 @@ from pathlib import Path
 
 DEFAULT_DB_PATH = str(Path(__file__).resolve().parent / "store.db")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # 多人并发：拿不到写锁时最多等这么久，再久才报"系统繁忙"
 BUSY_TIMEOUT_MS = 5000
@@ -96,12 +96,40 @@ CREATE TABLE IF NOT EXISTS viewings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id INTEGER NOT NULL REFERENCES customers(id),
     property_id INTEGER NOT NULL REFERENCES properties(id),
-    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    agent_id INTEGER NOT NULL REFERENCES agents(id),    -- 主带经纪人（全部参与人见 viewing_agents）
     viewing_time TEXT NOT NULL CHECK(is_valid_ts(viewing_time) = 1),  -- 带看时间，本地时间
-    feedback TEXT CHECK(feedback IS NULL OR length(trim(feedback)) BETWEEN 1 AND {MAX_FEEDBACK}),
-    feedback_at TEXT CHECK(feedback_at IS NULL OR is_valid_ts(feedback_at) = 1),
+    -- 登记时按「带看日期」从调价史推算的生效挂牌价，冻结后不再变：
+    -- 之后补录的追溯调价不改写既有快照，页面展示与漏斗分桶都读这一列，口径天然一致
+    list_price_snapshot REAL NOT NULL
+        CHECK(list_price_snapshot = list_price_snapshot
+              AND list_price_snapshot > 0 AND list_price_snapshot <= {MAX_PRICE}),
     created_by TEXT NOT NULL CHECK(length(trim(created_by)) BETWEEN 1 AND {MAX_NAME}),
     created_at TEXT NOT NULL CHECK(is_valid_ts(created_at) = 1)
+);
+
+-- 房源调价留痕：每次调价记前后价、生效日期、操作人；初始挂牌是第一行（old_price 为 NULL）
+CREATE TABLE IF NOT EXISTS price_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_id INTEGER NOT NULL REFERENCES properties(id),
+    old_price REAL  -- 调价前价格；NULL 仅初始挂牌行
+        CHECK(old_price IS NULL OR (old_price = old_price AND old_price > 0 AND old_price <= {MAX_PRICE})),
+    new_price REAL NOT NULL
+        CHECK(new_price = new_price AND new_price > 0 AND new_price <= {MAX_PRICE}),
+    effective_date TEXT NOT NULL CHECK(is_valid_date(effective_date) = 1),  -- 新价生效日期（含当天）
+    operator TEXT NOT NULL CHECK(length(trim(operator)) BETWEEN 1 AND {MAX_NAME}),
+    created_at TEXT NOT NULL CHECK(is_valid_ts(created_at) = 1)
+);
+
+-- 协同带看：一条带看的全部参与人（1 名主带 + 0~2 名协同），反馈按人各录各的
+CREATE TABLE IF NOT EXISTS viewing_agents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    viewing_id INTEGER NOT NULL REFERENCES viewings(id),
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    role TEXT NOT NULL CHECK(role IN ('主带', '协同')),
+    feedback TEXT CHECK(feedback IS NULL OR length(trim(feedback)) BETWEEN 1 AND {MAX_FEEDBACK}),
+    feedback_at TEXT CHECK(feedback_at IS NULL OR is_valid_ts(feedback_at) = 1),
+    created_at TEXT NOT NULL CHECK(is_valid_ts(created_at) = 1),
+    UNIQUE(viewing_id, agent_id)   -- 同一经纪人在一条带看中只能出现一次
 );
 
 CREATE TABLE IF NOT EXISTS deals (
@@ -133,6 +161,10 @@ CREATE INDEX IF NOT EXISTS idx_viewings_time ON viewings(viewing_time);
 CREATE INDEX IF NOT EXISTS idx_viewings_property ON viewings(property_id);
 CREATE INDEX IF NOT EXISTS idx_history_customer ON status_history(customer_id);
 CREATE INDEX IF NOT EXISTS idx_history_to ON status_history(to_status, created_at);
+CREATE INDEX IF NOT EXISTS idx_price_adj_property ON price_adjustments(property_id, effective_date, id);
+CREATE INDEX IF NOT EXISTS idx_viewing_agents_agent ON viewing_agents(agent_id);
+-- 一条带看恰好一名主带（协同人数由触发器限制）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_viewing_lead ON viewing_agents(viewing_id) WHERE role = '主带';
 
 -- 新客户入库时状态必须是「新客」，不能凭空造一个谈价/成交客户
 CREATE TRIGGER IF NOT EXISTS trg_customer_validate_insert
@@ -260,6 +292,94 @@ BEGIN
             THEN RAISE(ABORT, '房源状态只能从「在售」变为「已成交」')
         WHEN NOT EXISTS(SELECT 1 FROM deals WHERE property_id = NEW.id)
             THEN RAISE(ABORT, '把房源标记为已成交之前必须先登记成交单')
+    END;
+END;
+
+-- 调价留痕的合法性：在售房源才能调价；生效日期不能是未来、不能早于挂牌日；
+-- 时间线只许追加（生效日期不早于上一次调价）；调价前价格必须等于当前最新价，
+-- 且新价必须不同于旧价；初始挂牌行（old_price 为 NULL）只能是第一行。
+CREATE TRIGGER IF NOT EXISTS trg_price_adj_validate_insert
+BEFORE INSERT ON price_adjustments
+BEGIN
+    SELECT CASE
+        WHEN (SELECT status FROM properties WHERE id = NEW.property_id) <> '在售'
+            THEN RAISE(ABORT, '已成交房源不能调价')
+        WHEN NEW.effective_date < (SELECT list_date FROM properties WHERE id = NEW.property_id)
+            THEN RAISE(ABORT, '调价生效日期不能早于房源挂牌日期')
+        WHEN NEW.effective_date > substr(NEW.created_at, 1, 10)
+            THEN RAISE(ABORT, '调价生效日期不能是未来日期')
+        WHEN NEW.old_price IS NULL
+                AND EXISTS(SELECT 1 FROM price_adjustments WHERE property_id = NEW.property_id)
+            THEN RAISE(ABORT, '只有初始挂牌可以没有调价前价格')
+        WHEN NEW.old_price IS NOT NULL
+                AND NOT EXISTS(SELECT 1 FROM price_adjustments WHERE property_id = NEW.property_id)
+            THEN RAISE(ABORT, '首条调价记录必须是初始挂牌')
+        WHEN NEW.old_price IS NOT NULL AND NEW.old_price <> (
+                SELECT pa.new_price FROM price_adjustments pa
+                WHERE pa.property_id = NEW.property_id
+                ORDER BY pa.effective_date DESC, pa.id DESC LIMIT 1)
+            THEN RAISE(ABORT, '调价前价格必须与当前挂牌价一致')
+        WHEN NEW.old_price IS NOT NULL AND NEW.new_price = NEW.old_price
+            THEN RAISE(ABORT, '新挂牌价必须与当前价不同')
+        WHEN NEW.effective_date < (
+                SELECT MAX(pa.effective_date) FROM price_adjustments pa
+                WHERE pa.property_id = NEW.property_id)
+            THEN RAISE(ABORT, '调价生效日期不能早于上一次调价的生效日期')
+    END;
+END;
+
+-- 调价生效即同步当前挂牌价（properties.list_price 只是最新生效价的冗余）
+CREATE TRIGGER IF NOT EXISTS trg_price_adj_sync_list_price
+AFTER INSERT ON price_adjustments
+BEGIN
+    UPDATE properties SET list_price = NEW.new_price WHERE id = NEW.property_id;
+END;
+
+-- 挂牌价只能由调价流程改写：直接 UPDATE list_price 改成别的值会被拦下
+CREATE TRIGGER IF NOT EXISTS trg_property_price_guard
+BEFORE UPDATE OF list_price ON properties
+BEGIN
+    SELECT CASE WHEN NEW.list_price <> COALESCE(
+            (SELECT pa.new_price FROM price_adjustments pa
+             WHERE pa.property_id = NEW.id
+             ORDER BY pa.effective_date DESC, pa.id DESC LIMIT 1),
+            OLD.list_price)
+        THEN RAISE(ABORT, '挂牌价只能通过调价流程修改（调价会自动同步挂牌价）')
+    END;
+END;
+
+-- 带看快照必须等于「带看日期」当天生效的挂牌价（含生效日当天起算新价），
+-- 与服务层登记时的推算口径一致；绕过服务层写错误快照会被拦下。
+CREATE TRIGGER IF NOT EXISTS trg_viewing_snapshot_check
+BEFORE INSERT ON viewings
+BEGIN
+    SELECT CASE WHEN NEW.list_price_snapshot <> COALESCE(
+            (SELECT pa.new_price FROM price_adjustments pa
+             WHERE pa.property_id = NEW.property_id
+               AND pa.effective_date <= substr(NEW.viewing_time, 1, 10)
+             ORDER BY pa.effective_date DESC, pa.id DESC LIMIT 1),
+            (SELECT list_price FROM properties WHERE id = NEW.property_id))
+        THEN RAISE(ABORT, '带看价格快照必须等于带看日期当天生效的挂牌价')
+    END;
+END;
+
+-- 协同带看参与人：必须是在职经纪人；主带必须与带看记录上的主带一致；
+-- 先登记主带再登记协同；一条带看最多 3 名经纪人。
+CREATE TRIGGER IF NOT EXISTS trg_viewing_agent_validate_insert
+BEFORE INSERT ON viewing_agents
+BEGIN
+    SELECT CASE
+        WHEN (SELECT active FROM agents WHERE id = NEW.agent_id) IS NOT 1
+            THEN RAISE(ABORT, '经纪人不存在或已停用')
+        WHEN NEW.role = '主带'
+                AND NEW.agent_id <> (SELECT agent_id FROM viewings WHERE id = NEW.viewing_id)
+            THEN RAISE(ABORT, '主带经纪人必须与带看记录一致')
+        WHEN NEW.role = '协同'
+                AND NOT EXISTS(SELECT 1 FROM viewing_agents
+                               WHERE viewing_id = NEW.viewing_id AND role = '主带')
+            THEN RAISE(ABORT, '必须先登记主带经纪人，再登记协同经纪人')
+        WHEN (SELECT COUNT(*) FROM viewing_agents WHERE viewing_id = NEW.viewing_id) >= 3
+            THEN RAISE(ABORT, '一条带看最多 3 名经纪人')
     END;
 END;
 """

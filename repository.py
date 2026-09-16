@@ -48,13 +48,64 @@ def get_property(conn, property_id):
 
 
 def list_properties(conn):
+    """全部房源；viewing_count 是该房源的带看次数（按带看记录计，协同带看只算一次）。"""
     return conn.execute(
-        "SELECT * FROM properties ORDER BY list_date DESC, id DESC"
+        """SELECT p.*,
+                  (SELECT COUNT(*) FROM viewings v WHERE v.property_id = p.id) AS viewing_count
+           FROM properties p ORDER BY list_date DESC, id DESC"""
     ).fetchall()
 
 
 def update_property_status(conn, property_id, status):
     conn.execute("UPDATE properties SET status = ? WHERE id = ?", (status, property_id))
+
+
+# ---------- 调价留痕 ----------
+
+def add_price_adjustment(conn, property_id, old_price, new_price, effective_date, operator, now):
+    """写入一条调价记录（初始挂牌行 old_price 为 None）。
+
+    properties.list_price 由数据库触发器同步为最新生效价，本层不重复写。
+    """
+    cur = conn.execute(
+        """INSERT INTO price_adjustments (property_id, old_price, new_price, effective_date, operator, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (property_id, old_price, new_price, effective_date, operator, now),
+    )
+    return cur.lastrowid
+
+
+def list_price_adjustments(conn, property_id):
+    """某房源的调价历史（含初始挂牌行），最新的在前。"""
+    return conn.execute(
+        """SELECT * FROM price_adjustments
+           WHERE property_id = ? ORDER BY effective_date DESC, id DESC""",
+        (property_id,),
+    ).fetchall()
+
+
+def latest_price_adjustment(conn, property_id):
+    """当前最新一条调价记录（时间线末尾），没有则 None。"""
+    return conn.execute(
+        """SELECT * FROM price_adjustments
+           WHERE property_id = ? ORDER BY effective_date DESC, id DESC LIMIT 1""",
+        (property_id,),
+    ).fetchone()
+
+
+def price_on_date(conn, property_id, date_str):
+    """date_str（'YYYY-MM-DD'）当天生效的挂牌价：生效日期不晚于该日的最新一条记录。
+
+    房源必有初始挂牌行（生效日期 = 挂牌日期），因此 date_str >= 挂牌日期时必有结果；
+    返回 None 仅意味着该日早于挂牌日。
+    """
+    row = conn.execute(
+        """SELECT new_price FROM price_adjustments
+           WHERE property_id = ? AND effective_date <= ?
+           ORDER BY effective_date DESC, id DESC LIMIT 1""",
+        (property_id, date_str),
+    ).fetchone()
+    return row[0] if row else None
 
 
 # ---------- 客户 ----------
@@ -106,21 +157,21 @@ def list_status_history(conn, customer_id):
 
 # ---------- 带看 ----------
 
-def add_viewing(conn, customer_id, property_id, agent_id, viewing_time, operator, now):
+def add_viewing(conn, customer_id, property_id, agent_id, viewing_time, list_price_snapshot, operator, now):
     cur = conn.execute(
-        """INSERT INTO viewings (customer_id, property_id, agent_id, viewing_time, created_by, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (customer_id, property_id, agent_id, viewing_time, operator, now),
+        """INSERT INTO viewings (customer_id, property_id, agent_id, viewing_time, list_price_snapshot, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (customer_id, property_id, agent_id, viewing_time, list_price_snapshot, operator, now),
     )
     return cur.lastrowid
 
 
 def list_viewings(conn):
+    """全部带看记录（主带经纪人来自 viewings.agent_id；参与人明细用 list_all_participants）。"""
     return conn.execute(
-        """SELECT v.id, v.viewing_time, v.customer_id, v.property_id,
+        """SELECT v.id, v.viewing_time, v.customer_id, v.property_id, v.list_price_snapshot,
                   c.name AS customer_name, p.community, p.layout,
-                  a.name AS agent_name, v.feedback, v.feedback_at,
-                  v.created_by, v.created_at
+                  a.name AS agent_name, v.created_by, v.created_at
            FROM viewings v
            JOIN customers c ON c.id = v.customer_id
            JOIN properties p ON p.id = v.property_id
@@ -150,10 +201,54 @@ def first_viewing_date(conn, customer_id):
     return datetime.strptime(row, "%Y-%m-%d %H:%M:%S").date() if row else None
 
 
-def set_feedback(conn, viewing_id, feedback, feedback_at):
+# ---------- 带看参与人（主带/协同）与按人反馈 ----------
+
+def add_viewing_agent(conn, viewing_id, agent_id, role, now):
     cur = conn.execute(
-        "UPDATE viewings SET feedback = ?, feedback_at = ? WHERE id = ?",
-        (feedback, feedback_at, viewing_id),
+        """INSERT INTO viewing_agents (viewing_id, agent_id, role, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (viewing_id, agent_id, role, now),
+    )
+    return cur.lastrowid
+
+
+def get_participant(conn, viewing_id, agent_id):
+    return conn.execute(
+        "SELECT * FROM viewing_agents WHERE viewing_id = ? AND agent_id = ?",
+        (viewing_id, agent_id),
+    ).fetchone()
+
+
+def list_all_participants(conn):
+    """全部带看参与人（含各自反馈），按带看分组、主带在前。"""
+    return conn.execute(
+        """SELECT va.viewing_id, va.agent_id, a.name AS agent_name,
+                  va.role, va.feedback, va.feedback_at
+           FROM viewing_agents va
+           JOIN agents a ON a.id = va.agent_id
+           ORDER BY va.viewing_id, CASE va.role WHEN '主带' THEN 0 ELSE 1 END, va.id"""
+    ).fetchall()
+
+
+def list_viewing_participations(conn, start, end):
+    """[start, end) 内带看的参与人行（含该条带看的参与人总数），供月报折算带看积分。"""
+    return conn.execute(
+        """SELECT va.agent_id, va.role,
+                  (SELECT COUNT(*) FROM viewing_agents x WHERE x.viewing_id = va.viewing_id)
+                      AS n_participants
+           FROM viewing_agents va
+           JOIN viewings v ON v.id = va.viewing_id
+           WHERE v.viewing_time >= ? AND v.viewing_time < ?""",
+        (start, end),
+    ).fetchall()
+
+
+def set_feedback(conn, viewing_id, agent_id, feedback, feedback_at):
+    """给某位参与人补反馈；已提交过的不覆盖（rowcount = 0）。"""
+    cur = conn.execute(
+        """UPDATE viewing_agents SET feedback = ?, feedback_at = ?
+           WHERE viewing_id = ? AND agent_id = ? AND feedback IS NULL""",
+        (feedback, feedback_at, viewing_id, agent_id),
     )
     return cur.rowcount
 
@@ -242,17 +337,33 @@ def stale_properties(conn, list_date_before, idle_since):
 
 
 def overdue_feedback_viewings(conn, deadline):
-    """带看时间早于 deadline 仍未补反馈的记录。"""
+    """带看时间早于 deadline 且仍有参与人未补反馈的记录（pending_agents 列出待补人）。"""
     return conn.execute(
         """SELECT v.id, v.viewing_time, c.name AS customer_name, p.community,
-                  a.name AS agent_name, v.created_by
+                  a.name AS agent_name, v.created_by,
+                  (SELECT GROUP_CONCAT(name, '、') FROM (
+                      SELECT a2.name AS name
+                      FROM viewing_agents va JOIN agents a2 ON a2.id = va.agent_id
+                      WHERE va.viewing_id = v.id AND va.feedback IS NULL
+                      ORDER BY va.id)) AS pending_agents
            FROM viewings v
            JOIN customers c ON c.id = v.customer_id
            JOIN properties p ON p.id = v.property_id
            JOIN agents a ON a.id = v.agent_id
-           WHERE v.feedback IS NULL AND v.viewing_time < ?
+           WHERE v.viewing_time < ?
+             AND EXISTS(SELECT 1 FROM viewing_agents va
+                        WHERE va.viewing_id = v.id AND va.feedback IS NULL)
            ORDER BY v.viewing_time""",
         (deadline,),
+    ).fetchall()
+
+
+def list_viewing_snapshots_in_range(conn, start, end):
+    """[start, end) 内全部带看的价格快照（漏斗按价格区间分桶用，与带看记录页同一列）。"""
+    return conn.execute(
+        """SELECT list_price_snapshot FROM viewings
+           WHERE viewing_time >= ? AND viewing_time < ?""",
+        (start, end),
     ).fetchall()
 
 

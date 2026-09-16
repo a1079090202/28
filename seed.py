@@ -1,7 +1,9 @@
-"""样例数据：8 个经纪人、10 套房源、14 个客户、20 条带看、2 笔成交。
+"""样例数据：8 个经纪人、11 套房源、14 个客户、25 条带看（含 2 条协同带看）、2 笔成交。
 
 所有日期相对运行当天生成，保证首次启动后当月漏斗、超时反馈、滞销提醒
 开箱就能看到数据。全部通过 services 层写入，状态历史与正式使用一致。
+其中「滨江华庭」挂牌 158 万、月内两次降价（158→150→145），并有三条
+跨调价日的带看，用于演示调价留痕与带看价格快照。
 """
 from datetime import datetime, timedelta
 
@@ -28,7 +30,12 @@ PROPERTIES = [
     ("龙湖原著", "五室及以上", 780, 5),
     ("华润悦府", "三室两厅", 445, 33),
     ("绿城桂语", "两室两厅", 230, 90),       # 滞销：从未带看
+    ("滨江华庭", "三室一厅", 158, 30),       # 月内两次降价：158→150→145（见 ADJUSTMENTS）
 ]
+
+# 滨江华庭的两次降价：(新价, 几天前生效并登记)；演示调价留痕与带看快照
+ADJUSTMENTS = [(150, 6), (145, 2)]
+BINJIANG_IDX = 10  # 滨江华庭在 PROPERTIES 中的序号
 
 # (姓名, 电话, 经纪人序号, 录入天数前)
 CUSTOMERS = [
@@ -70,6 +77,16 @@ VIEWINGS = [
     (2, 1, 0, 5, None),                     # 刚带看，未到 24 小时
     (11, 5, 3, 30, None),                   # 超时未反馈
     (12, 0, 4, 8, None),                    # 刚带看，未到 24 小时
+    # 滨江华庭跨调价日的三条带看：快照应分别为 158 / 150 / 145
+    (12, 10, 4, 240, "客户觉得 158 万略高，再考虑"),      # 第一次降价前 → 快照 158
+    (11, 10, 3, 96, "降到 150 万了，客户有点心动"),       # 两次降价之间 → 快照 150
+    (0, 10, 0, 20, None),                                # 第二次降价后 → 快照 145
+]
+
+# 协同带看：(客户序号, 房源序号, 主带经纪人序号, [协同经纪人序号], 几小时前, [主带反馈, 协同反馈...])
+COLLAB_VIEWINGS = [
+    (8, 8, 7, [0, 1], 48, ["客户预算够，意向强", "客户反复问学区划分", "客户想约周末复看"]),  # 三人拼团
+    (13, 5, 6, [4], 30, ["客户觉得性价比不错", "客户关心车位配比"]),                          # 两人协同
 ]
 
 # 状态推进计划：(客户序号, 目标状态, 几小时前, 成交信息(房源序号, 成交价万) 或 None)
@@ -107,6 +124,14 @@ def ensure_seed(conn):
                 services.add_property(conn, community, layout, price, list_date, OPERATOR, now=base)
             )
 
+        # 滨江华庭月内两次降价（先于带看写入，带看快照才能按生效日期推算）
+        for new_price, days in ADJUSTMENTS:
+            when = base - timedelta(days=days)
+            services.adjust_price(
+                conn, prop_ids[BINJIANG_IDX], new_price, when.strftime("%Y-%m-%d"),
+                OPERATOR, now=when,
+            )
+
         cust_ids = []
         for name, phone, ai, days in CUSTOMERS:
             cust_ids.append(
@@ -122,7 +147,20 @@ def ensure_seed(conn):
                 conn, cust_ids[ci], prop_ids[pi], agent_ids[ai], vt, OPERATOR, now=vt
             )
             if feedback:
-                services.submit_feedback(conn, vid, feedback, now=vt + timedelta(hours=3))
+                services.submit_feedback(conn, vid, agent_ids[ai], feedback, now=vt + timedelta(hours=3))
+
+        # 协同带看：一条记录挂多名经纪人，每位参与人各自补反馈
+        for ci, pi, lead_ai, assist_ais, hours, feedbacks in COLLAB_VIEWINGS:
+            vt = base - timedelta(hours=hours)
+            vid = services.record_viewing(
+                conn, cust_ids[ci], prop_ids[pi], agent_ids[lead_ai], vt, OPERATOR, now=vt,
+                assist_agent_ids=[agent_ids[a] for a in assist_ais],
+            )
+            for ai, fb in zip([lead_ai] + list(assist_ais), feedbacks):
+                if fb:
+                    services.submit_feedback(
+                        conn, vid, agent_ids[ai], fb, now=vt + timedelta(hours=3)
+                    )
 
         for ci, target, hours, deal in sorted(STATUS_PLAN, key=lambda x: -x[2]):
             when = base - timedelta(hours=hours)

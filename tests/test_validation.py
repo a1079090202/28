@@ -86,9 +86,9 @@ class TestServiceValueValidation(ValidationTestBase):
             services.add_property(self.conn, "花" * 101, "两室一厅", 100, "2026-09-01", "店长")
         vid = self._viewing()
         with self.assertRaises(ValueError):
-            services.submit_feedback(self.conn, vid, "好" * (MAX_FEEDBACK + 1))
+            services.submit_feedback(self.conn, vid, self.aid, "好" * (MAX_FEEDBACK + 1))
         # 合法长度可以通过
-        services.submit_feedback(self.conn, vid, "好" * MAX_FEEDBACK)
+        services.submit_feedback(self.conn, vid, self.aid, "好" * MAX_FEEDBACK)
 
     def test_real_calendar_dates(self):
         with self.assertRaises(ValueError):
@@ -184,7 +184,7 @@ class TestServiceValueValidation(ValidationTestBase):
                 self.conn, "1", self.pid, self.aid, datetime(2026, 9, 2), "店长"
             )
         with self.assertRaises(ValueError):
-            services.submit_feedback(self.conn, True, "反馈")
+            services.submit_feedback(self.conn, True, self.aid, "反馈")
 
 
 class TestDatabaseChecks(ValidationTestBase):
@@ -227,15 +227,15 @@ class TestDatabaseChecks(ValidationTestBase):
 
     def test_viewing_before_listing_trigger(self):
         self.raw_rejected(
-            "INSERT INTO viewings(customer_id,property_id,agent_id,viewing_time,created_by,created_at) "
-            "VALUES(?,?,?,'2026-07-01 10:00:00','店长','2026-09-02 10:00:00')",
+            "INSERT INTO viewings(customer_id,property_id,agent_id,viewing_time,list_price_snapshot,created_by,created_at) "
+            "VALUES(?,?,?,'2026-07-01 10:00:00',185,'店长','2026-09-02 10:00:00')",
             (self.cid, self.pid, self.aid),
         )
 
     def test_viewing_later_than_entry_trigger(self):
         self.raw_rejected(
-            "INSERT INTO viewings(customer_id,property_id,agent_id,viewing_time,created_by,created_at) "
-            "VALUES(?,?,?,'2026-09-02 11:00:00','店长','2026-09-02 10:00:00')",
+            "INSERT INTO viewings(customer_id,property_id,agent_id,viewing_time,list_price_snapshot,created_by,created_at) "
+            "VALUES(?,?,?,'2026-09-02 11:00:00',185,'店长','2026-09-02 10:00:00')",
             (self.cid, self.pid, self.aid),
         )
 

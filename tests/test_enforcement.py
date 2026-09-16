@@ -150,17 +150,17 @@ class TestServiceValidation(ServiceValidationTestBase):
         with self.assertRaises(services.ValidationError):
             services.record_viewing(self.conn, self.cid, self.pid, 999, datetime(2026, 9, 2), "店长")
         with self.assertRaises(services.ValidationError):
-            services.submit_feedback(self.conn, 999, "反馈")
+            services.submit_feedback(self.conn, 999, self.aid, "反馈")
 
     def test_feedback_must_be_nonblank_and_not_duplicated(self):
         vid = services.record_viewing(
             self.conn, self.cid, self.pid, self.aid, datetime(2026, 9, 2, 10), "店长", now=datetime(2026, 9, 2, 10)
         )
         with self.assertRaises(services.ValidationError):
-            services.submit_feedback(self.conn, vid, "   ")
-        services.submit_feedback(self.conn, vid, "客户有意向")
+            services.submit_feedback(self.conn, vid, self.aid, "   ")
+        services.submit_feedback(self.conn, vid, self.aid, "客户有意向")
         with self.assertRaises(services.ValidationError):
-            services.submit_feedback(self.conn, vid, "再补一条")
+            services.submit_feedback(self.conn, vid, self.aid, "再补一条")
 
     def test_inactive_agent_rejected(self):
         self.conn.execute("UPDATE agents SET active = 0 WHERE id = ?", (self.aid,))
@@ -187,7 +187,7 @@ class TestServiceValidation(ServiceValidationTestBase):
         vid = services.record_viewing(
             self.conn, self.cid, self.pid, self.aid, datetime(2026, 9, 2, 10), "店长", now=datetime(2026, 9, 2, 10)
         )
-        services.submit_feedback(self.conn, vid, "采光好，有意向", now=datetime(2026, 9, 2, 12))
+        services.submit_feedback(self.conn, vid, self.aid, "采光好，有意向", now=datetime(2026, 9, 2, 12))
         services.advance_customer(self.conn, self.cid, STATUS_NEGOTIATING, "店长", now=datetime(2026, 9, 3))
         services.close_deal(self.conn, self.cid, self.pid, self.aid, 178, "2026-09-04", "店长", now=datetime(2026, 9, 4))
         self.assertEqual(repo.get_customer(self.conn, self.cid)["status"], STATUS_DEAL)
@@ -252,8 +252,8 @@ class TestDatabaseEnforcement(ServiceValidationTestBase):
         )
         self.conn.commit()
         self.assert_sql_rejected(
-            "INSERT INTO viewings (customer_id, property_id, agent_id, viewing_time, created_by, created_at) "
-            "VALUES (?, ?, ?, ?, 'x', ?)",
+            "INSERT INTO viewings (customer_id, property_id, agent_id, viewing_time, list_price_snapshot, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, 185, 'x', ?)",
             (self.cid, self.pid, self.aid, "2026-09-03 10:00:00", "2026-09-03 10:00:00"),
         )
 

@@ -86,7 +86,7 @@ class TestOverdueFeedback(unittest.TestCase):
         vt = NOW - timedelta(hours=hours_ago)
         vid = services.record_viewing(self.conn, self.cid, self.pid, self.aid, vt, "店长", now=vt)
         if feedback:
-            services.submit_feedback(self.conn, vid, feedback, now=vt + timedelta(hours=2))
+            services.submit_feedback(self.conn, vid, self.aid, feedback, now=vt + timedelta(hours=2))
         return vid
 
     def test_overdue_rules(self):
@@ -99,7 +99,7 @@ class TestOverdueFeedback(unittest.TestCase):
     def test_feedback_submitted_after_deadline_clears_overdue(self):
         vid = self._viewing(30)
         self.assertEqual(len(services.overdue_feedback(self.conn, now=NOW)), 1)
-        services.submit_feedback(self.conn, vid, "补录：客户嫌楼层低", now=NOW)
+        services.submit_feedback(self.conn, vid, self.aid, "补录：客户嫌楼层低", now=NOW)
         self.assertEqual(services.overdue_feedback(self.conn, now=NOW), [])
 
 

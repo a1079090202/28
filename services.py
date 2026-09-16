@@ -37,6 +37,41 @@ STALE_IDLE_DAYS = 14          # 且最近 14 天没有带看 → 提醒催房东
 PROPERTY_ON_SALE = "在售"
 PROPERTY_SOLD = "已成交"
 
+# 协同带看：一条带看 1 名主带 + 最多 2 名协同（共至多 3 人）
+ROLE_LEAD = "主带"
+ROLE_ASSIST = "协同"
+MAX_VIEWING_AGENTS = 3
+
+# 带看积分（月报）：单独带看主带拿满分；协同带看主带 70%、协同方合计 30%（多人平分）。
+# 单位：百分之一分。整数折算避免浮点误差，每条带看的全员积分合计恒等于 1 分。
+POINTS_LEAD_SOLO = 100
+POINTS_LEAD_COLLAB = 70
+POINTS_ASSIST_COLLAB_TOTAL = 30
+
+# 挂牌价分桶：边界值归下桶（150 万整归「150万以下」，200 万整归「150-200万」）
+PRICE_BUCKET_LOW = 150
+PRICE_BUCKET_MID = 200
+PRICE_BUCKET_LABELS = ("150万以下", "150-200万", "200万以上")
+
+
+def price_bucket(price):
+    """挂牌价（万）所属价格区间；边界值归下桶。分桶规则只此一处，页面与漏斗共用。"""
+    if price <= PRICE_BUCKET_LOW:
+        return PRICE_BUCKET_LABELS[0]
+    if price <= PRICE_BUCKET_MID:
+        return PRICE_BUCKET_LABELS[1]
+    return PRICE_BUCKET_LABELS[2]
+
+
+def viewing_point_split(n_assists):
+    """一条带看的积分拆分，返回 (主带积分, 每名协同积分)，单位百分之一分。"""
+    if isinstance(n_assists, bool) or not isinstance(n_assists, int) \
+            or not 0 <= n_assists < MAX_VIEWING_AGENTS:
+        raise ValidationError(f"协同经纪人人数不合法：{n_assists}")
+    if n_assists == 0:
+        return POINTS_LEAD_SOLO, 0
+    return POINTS_LEAD_COLLAB, POINTS_ASSIST_COLLAB_TOTAL // n_assists
+
 
 class ValidationError(ValueError):
     """业务规则校验失败（页面可直接展示消息）。"""
@@ -240,6 +275,8 @@ def add_property(conn, community, layout, list_price, list_date, operator, now=N
     try:
         _begin(conn)
         pid = repo.add_property(conn, community, layout, list_price, list_date, operator, ts)
+        # 初始挂牌是调价史的第一行（old_price 为 NULL），之后所有「某天生效价」都查这张表
+        repo.add_price_adjustment(conn, pid, None, list_price, list_date, operator, ts)
         conn.commit()
     except sqlite3.OperationalError as e:
         _rollback(conn)
@@ -250,6 +287,52 @@ def add_property(conn, community, layout, list_price, list_date, operator, now=N
         _rollback(conn)
         raise ValidationError(f"房源数据不合法：{e}") from e
     return pid
+
+
+def adjust_price(conn, property_id, new_price, effective_date, operator, now=None):
+    """房源调价：写入调价留痕（前后价、生效日期、操作人），当前挂牌价由触发器同步。
+
+    规则（服务层强制）：
+    - 只有在售房源能调价；新价必须为正的有限数字且不同于当前价
+    - 生效日期必须真实存在、不能是未来、不能早于挂牌日期
+    - 时间线只许追加：生效日期不能早于上一次调价的生效日期
+      （追溯调价允许填过去某天，但不能插到既有调价记录之前，保证「某天生效价」唯一确定）
+    - 已登记的带看快照不因此改写：快照在登记时冻结，追溯调价只影响之后新登记的带看
+    """
+    operator = _require_text(operator, "操作人", MAX_NAME)
+    _require_int_id(property_id, "房源")
+    new_price = _require_positive(new_price, "新挂牌价")
+    ts_dt = datetime.strptime(_resolve_ts(now), FMT)
+    effective_date = _require_date(effective_date, "调价生效日期", not_future=True, now=ts_dt)
+    ts = _fmt(ts_dt)
+    try:
+        _begin(conn)
+        prop = _get_property(conn, property_id)
+        if prop["status"] != PROPERTY_ON_SALE:
+            raise ValidationError(f"房源「{prop['community']}」已成交，不能调价")
+        if effective_date < prop["list_date"]:
+            raise ValidationError("调价生效日期不能早于房源挂牌日期")
+        latest = repo.latest_price_adjustment(conn, property_id)
+        if latest and effective_date < latest["effective_date"]:
+            raise ValidationError(
+                f"调价生效日期不能早于上一次调价的生效日期（{latest['effective_date']}）"
+            )
+        current = prop["list_price"]
+        if new_price == current:
+            raise ValidationError(f"新挂牌价必须与当前价（{current:g} 万）不同")
+        repo.add_price_adjustment(conn, property_id, current, new_price, effective_date, operator, ts)
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        _rollback(conn)
+        if _is_lock_error(e):
+            raise BusyError("系统繁忙，请稍后重试") from e
+        raise
+    except ValueError:
+        _rollback(conn)
+        raise
+    except sqlite3.IntegrityError as e:
+        _rollback(conn)
+        raise ValidationError(f"调价被数据库拒绝：{e}") from e
 
 
 def register_customer(conn, name, phone, agent_id, operator, now=None):
@@ -312,19 +395,32 @@ def advance_customer(conn, customer_id, to_status, operator, now=None):
         raise ValidationError(f"状态推进被数据库拒绝：{e}") from e
 
 
-def record_viewing(conn, customer_id, property_id, agent_id, viewing_time, operator, now=None):
-    """登记带看；如果客户还是「新客」，首次带看后自动推进为「带看」。
+def record_viewing(conn, customer_id, property_id, agent_id, viewing_time, operator,
+                   now=None, assist_agent_ids=None):
+    """登记带看（可挂 1~2 名协同经纪人）；如果客户还是「新客」，首次带看后自动推进为「带看」。
 
     规则（服务层强制，不靠页面过滤）：
     - 客户必须存在且不在终态（成交/流失客户不能再登记带看）
     - 房源必须在售（已成交房源不能带看）
-    - 经纪人必须在职
+    - 主带与协同经纪人必须在职；一条带看最多 3 名经纪人（1 主带 + 最多 2 协同）；
+      同一经纪人在一条带看中只能出现一次（登记前当场拦下）
     - 带看时间不能是未来、不能晚于登记时间、不能早于客户建档或房源挂牌
+    - 登记时按「带看日期」从调价史推算生效挂牌价并冻结为快照（之后调价不改写）
+    - 协同带看也是一条带看记录：新客自动转「带看」只推一次，房源带看次数只算一次
     """
     operator = _require_text(operator, "操作人", MAX_NAME)
     _require_int_id(customer_id, "客户")
     _require_int_id(property_id, "房源")
-    _require_int_id(agent_id, "经纪人")
+    _require_int_id(agent_id, "主带经纪人")
+    assists = list(assist_agent_ids) if assist_agent_ids else []
+    for a in assists:
+        _require_int_id(a, "协同经纪人")
+    if len(assists) + 1 > MAX_VIEWING_AGENTS:
+        raise ValidationError(
+            f"一条带看最多 {MAX_VIEWING_AGENTS} 名经纪人（1 名主带 + 最多 2 名协同）"
+        )
+    if len(set([agent_id] + assists)) != len(assists) + 1:
+        raise ValidationError("同一经纪人在一条带看中只能出现一次（主带/协同不能重复）")
     ts = _resolve_ts(now)
     ts_dt = datetime.strptime(ts, FMT)
     vt = _require_timestamp(viewing_time, "带看时间", not_future_against=ts_dt)
@@ -338,12 +434,21 @@ def record_viewing(conn, customer_id, property_id, agent_id, viewing_time, opera
         if prop["status"] != PROPERTY_ON_SALE:
             raise ValidationError(f"房源「{prop['community']}」已成交，不能登记带看")
         _get_active_agent(conn, agent_id)
+        for a in assists:
+            _get_active_agent(conn, a)
         customer_created = datetime.strptime(customer["created_at"], FMT)
         if vt_dt < customer_created:
             raise ValidationError("带看时间不能早于客户建档时间")
         if vt_dt.date() < datetime.strptime(prop["list_date"], DATE_FMT).date():
             raise ValidationError("带看时间不能早于房源挂牌日期")
-        vid = repo.add_viewing(conn, customer_id, property_id, agent_id, vt, operator, ts)
+        # 快照 = 带看日期当天生效的挂牌价（生效日当天起算新价）；冻结后不再变
+        snapshot = repo.price_on_date(conn, property_id, vt[:10])
+        if snapshot is None:  # 正常流程必有初始挂牌行，这里只是兜底
+            snapshot = prop["list_price"]
+        vid = repo.add_viewing(conn, customer_id, property_id, agent_id, vt, snapshot, operator, ts)
+        repo.add_viewing_agent(conn, vid, agent_id, ROLE_LEAD, ts)
+        for a in assists:
+            repo.add_viewing_agent(conn, vid, a, ROLE_ASSIST, ts)
         if customer["status"] == STATUS_NEW:
             # 带看先入库（触发器此时看到的客户仍是「新客」），再自动推进状态
             repo.add_status_history(conn, customer_id, STATUS_NEW, STATUS_VIEWING, operator, ts)
@@ -363,20 +468,23 @@ def record_viewing(conn, customer_id, property_id, agent_id, viewing_time, opera
     return vid
 
 
-def submit_feedback(conn, viewing_id, feedback, now=None):
+def submit_feedback(conn, viewing_id, agent_id, feedback, now=None):
+    """给一条带看的某位参与人（主带/协同）补客户反馈；每人各录各的，只能提交一次。"""
     feedback = _require_text(feedback, "客户反馈", MAX_FEEDBACK)
     _require_int_id(viewing_id, "带看记录")
+    _require_int_id(agent_id, "经纪人")
     ts = _resolve_ts(now)
     try:
         _begin(conn)
         viewing = repo.get_viewing(conn, viewing_id)
         if viewing is None:
             raise ValidationError(f"带看记录不存在：{viewing_id}")
-        if viewing["feedback"]:
-            raise ValidationError("该带看已补过反馈，不能重复提交")
-        changed = repo.set_feedback(conn, viewing_id, feedback, ts)
-        if not changed:
-            raise ValidationError(f"带看记录不存在：{viewing_id}")
+        participant = repo.get_participant(conn, viewing_id, agent_id)
+        if participant is None:
+            raise ValidationError("该经纪人不是这条带看的参与人，不能代录反馈")
+        if participant["feedback"]:
+            raise ValidationError("该经纪人已提交过这条带看的反馈，不能重复提交")
+        repo.set_feedback(conn, viewing_id, agent_id, feedback, ts)
         conn.commit()
     except sqlite3.OperationalError as e:
         _rollback(conn)
@@ -463,6 +571,19 @@ def funnel_stats(conn, year, month):
     }
 
 
+def funnel_viewing_price_buckets(conn, year, month):
+    """本月带看按价格快照分桶：{区间标签: 带看组数}，三个桶恒在（无数据为 0）。
+
+    数据源与带看记录页是同一列（viewings.list_price_snapshot，登记时冻结），
+    因此页面看到的每条带看价格与漏斗分桶必然一致；合计恒等于漏斗的「带看」数。
+    """
+    start, end = month_bounds(year, month)
+    counts = {label: 0 for label in PRICE_BUCKET_LABELS}
+    for row in repo.list_viewing_snapshots_in_range(conn, start, end):
+        counts[price_bucket(row["list_price_snapshot"])] += 1
+    return counts
+
+
 def stale_properties(conn, now=None):
     """挂牌超 45 天且近 14 天无带看的在售房源（该催房东调价了）。"""
     now = now or datetime.now()
@@ -479,9 +600,29 @@ def overdue_feedback(conn, now=None):
 
 
 def monthly_agent_report(conn, year, month):
-    """每个经纪人当月的带看组数和成交单数。"""
+    """每个经纪人当月的带看组数（按主带计）、带看积分（协同折算）和成交单数。
+
+    带看积分：单独带看主带 1 分；协同带看主带 0.7 分、协同经纪人平分 0.3 分。
+    口径保证：全员积分合计 = 全员带看组数合计 = 门店漏斗的「带看」数
+    （协同带看是一条带看记录，只算一次）。
+    """
     start, end = month_bounds(year, month)
-    return repo.agent_monthly_report(conn, start, end)
+    rows = repo.agent_monthly_report(conn, start, end)
+    points = {}
+    for p in repo.list_viewing_participations(conn, start, end):
+        lead_pts, assist_pts = viewing_point_split(p["n_participants"] - 1)
+        pts = lead_pts if p["role"] == ROLE_LEAD else assist_pts
+        points[p["agent_id"]] = points.get(p["agent_id"], 0) + pts
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "viewing_count": r["viewing_count"],
+            "viewing_points": points.get(r["id"], 0) / 100,
+            "deal_count": r["deal_count"],
+        }
+        for r in rows
+    ]
 
 
 def deals_of_month(conn, year, month):
